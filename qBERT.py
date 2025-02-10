@@ -309,37 +309,44 @@ class ParallelBERTGenerator(nn.Module):
                                     window_size: int) -> torch.Tensor:
         """Process context using batched bidirectional and cross attention."""
         batch_size = embeddings.shape[0]
+        matrix_size = matrix.shape[0]
+        
+        # Safely calculate context windows
         start_idx = max(0, position - window_size)
-        end_idx = min(matrix.shape[0], position + window_size + 1)
+        # Ensure end_idx doesn't exceed matrix bounds
+        end_idx = min(matrix_size, position + window_size + 1)
         
         # Get forward and backward context for all batches
         forward_context = matrix[start_idx:position, :, 0, :].transpose(0, 1)
-        backward_context = matrix[position+1:end_idx, :, 0, :].transpose(0, 1)
+        # Only get backward context if we're not at the end
+        backward_context = matrix[position+1:end_idx, :, 0, :].transpose(0, 1) if position + 1 < matrix_size else torch.empty(
+            (batch_size, 0, self.config.embedding_dim), device=self.config.device
+        )
         
-        # Process forward context
-        if forward_context.size(1) > 0:
-            forward_proj = self.forward_proj(forward_context)
-            forward_attn = F.scaled_dot_product_attention(
+        # Process forward context if available
+        forward_attn = (
+            F.scaled_dot_product_attention(
                 embeddings.unsqueeze(1),
-                forward_proj,
+                self.forward_proj(forward_context),
                 forward_context,
                 is_causal=False
             ).squeeze(1)
-        else:
-            forward_attn = torch.zeros_like(embeddings)
+            if forward_context.size(1) > 0
+            else torch.zeros_like(embeddings)
+        )
         
-        # Process backward context
-        if backward_context.size(1) > 0:
-            backward_proj = self.backward_proj(backward_context)
-            backward_attn = F.scaled_dot_product_attention(
+        # Process backward context if available
+        backward_attn = (
+            F.scaled_dot_product_attention(
                 embeddings.unsqueeze(1),
-                backward_proj,
+                self.backward_proj(backward_context),
                 backward_context,
                 is_causal=False
             ).squeeze(1)
-        else:
-            backward_attn = torch.zeros_like(embeddings)
-            
+            if backward_context.size(1) > 0
+            else torch.zeros_like(embeddings)
+        )
+        
         # Process cross attention to initial prompt (bounded by window_size)
         cross_start_idx = max(0, position - window_size)
         initial_context = matrix[cross_start_idx:position, :, 0, :].transpose(0, 1)
@@ -413,7 +420,6 @@ class ParallelBERTGenerator(nn.Module):
         
         scaled_scores = combined_scores[valid_candidates] / temperature
         probs = F.softmax(scaled_scores, dim=-1)
-        
         sample_idx = torch.multinomial(probs, num_samples=1)
         valid_indices = torch.where(valid_candidates)[0]
         selected_idx = valid_indices[sample_idx]
@@ -427,18 +433,20 @@ class ParallelBERTGenerator(nn.Module):
         
         # Create matrix and get initial tokens
         matrix, input_ids = self.create_4d_matrix(initial_text)
+        available_positions = matrix.shape[0] - len(input_ids[0])
+        tokens_to_generate = min(num_tokens, available_positions)
         seq_len = input_ids.size(1)
         
         # Create batched padded tensors
         padded_input_ids = torch.full(
-            (self.config.batch_size, seq_len + num_tokens),
+            (self.config.batch_size, seq_len + tokens_to_generate),
             self.tokenizer.pad_token_id,
             device=self.config.device
         )
         padded_input_ids[:, :seq_len] = input_ids
         
         padded_attention_mask = torch.zeros(
-            (self.config.batch_size, seq_len + num_tokens),
+            (self.config.batch_size, seq_len + tokens_to_generate),
             device=self.config.device
         )
         padded_attention_mask[:, :seq_len] = 1
@@ -449,7 +457,7 @@ class ParallelBERTGenerator(nn.Module):
         prev_tokens = [None] * self.config.batch_size
         
         # Generate tokens
-        for position in range(seq_len, seq_len + num_tokens):
+        for position in range(seq_len, seq_len + tokens_to_generate):
             # Update attention mask for current position
             padded_attention_mask[:, :position + 1] = 1
             
