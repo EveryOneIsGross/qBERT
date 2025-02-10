@@ -6,7 +6,7 @@
 
 *chat with your base bert model*
 
-qBERT is an experimental neural text generation framework that explores coherent text generation through bidirectional context processing and semantic guidance. Unlike traditional generative language models, qBERT leverages BERT's bidirectional understanding while adding embedding mechanisms for controlled generation. 
+qBERT is an experimental neural text generation framework that explores coherent text generation through bidirectional context processing and semantic guidance. qBERT leverages BERT's bidirectional understanding while adding embedding mechanisms for controlled generation. 
 
 ## Core Innovations
 
