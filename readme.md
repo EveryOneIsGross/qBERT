@@ -69,6 +69,60 @@ qBERT is an experimental neural text generation framework that explores coherent
 - 4D Matrix for Batch Processing
 - Adaptive Temperature Sampling
 
+## Hyperparameters
+
+```
+> /config
+
+Current Configuration:
+Model Type: qbert
+max_length: 512
+batch_size: 8
+num_candidates: 128
+embedding_dim: 768
+context_window: 256
+base_temperature: 0.7
+min_threshold: 0.5
+top_k: 32
+compression_ratio: 0.2
+max_cache_size: 16
+device: cuda
+
+> /help
+
+    Commands:
+    /help   - Show this help message
+    /quit   - Exit the program
+    /config - Show current configuration
+    /clear  - Clear the screen
+    /device - Switch between CPU and GPU (usage: /device cpu|cuda)
+    /tokens - Set number of tokens to generate (usage: /tokens number)
+    /stream - Toggle streaming mode (currently: True)
+    /model  - Switch model type (usage: /model pubert|qbert)
+
+    Model Configuration:
+    /bert_model <name>     - Change BERT model
+    /sentence_model <name> - Change sentence transformer
+    /attn_impl <type>     - Change attention (eager/sdpa/flash_attention_2)
+
+    Parameters:
+    - max_length      (int)   : Maximum sequence length
+    - batch_size      (int)   : Batch size for processing
+    - num_candidates  (int)   : Number of candidate tokens
+    - embedding_dim   (int)   : Embedding dimension
+    - context_window  (int)   : Context window size
+    - base_temperature(float) : Temperature for sampling
+    - min_threshold   (float) : Minimum threshold for candidates
+    - top_k           (int)   : Top-k tokens to consider
+
+    Note: Update parameters with /<parameter> <value>
+
+
+> /bert_model Twitter/TwHIN-BERT-base
+
+>
+```
+
 ## CLI Features
 
 ```bash
