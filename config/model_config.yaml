@@ -1,0 +1,27 @@
+model_defaults:
+  bert_model: "bert-base-uncased"
+  tokenizer: "bert-base-uncased"
+  sentence_transformer: "all-MiniLM-L6-v2"
+  attention_implementation: "eager"
+
+pubert:
+  max_length: 1000
+  batch_size: 4
+  num_candidates: 128
+  embedding_dim: 768
+  context_window: 32
+  base_temperature: 0.5
+  min_threshold: 0.8
+  top_k: 50
+
+qbert:
+  max_length: 512
+  batch_size: 8
+  num_candidates: 128
+  embedding_dim: 768
+  context_window: 256
+  base_temperature: 0.7
+  min_threshold: 0.5
+  top_k: 32
+  compression_ratio: 0.2
+  max_cache_size: 16 
