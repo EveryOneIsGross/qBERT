@@ -6,7 +6,7 @@
 
 *chat with your base bert model*
 
-qBERT is an experimental neural text generation framework that explores coherent text generation through bidirectional context processing and semantic guidance. Unlike traditional unidirectional language models, qBERT leverages BERT's bidirectional understanding while adding novel mechanisms for controlled generation. Chat with your BASE bert model. ; p
+qBERT is an experimental neural text generation framework that explores coherent text generation through bidirectional context processing and semantic guidance. Unlike traditional generative language models, qBERT leverages BERT's bidirectional understanding while adding embedding mechanisms for controlled generation. 
 
 ## Core Innovations
 
@@ -31,39 +31,7 @@ qBERT is an experimental neural text generation framework that explores coherent
   - Vector-based memory search
   - Multi-model conversation orchestration
 
-## Installation
-
-```bash
-git clone https://github.com/yourusername/qBERT
-cd qBERT
-pip install -r requirements.txt
-```
-
 ## Quick Start
-
-```python
-from qBERT import ParallelBERTGenerator, GenerationConfig, ModelConfig
-
-# Initialize with custom configs
-config = GenerationConfig(
-    max_length=512,
-    batch_size=8,
-    num_candidates=128,
-    embedding_dim=768,
-    context_window=256
-)
-
-model_config = ModelConfig(
-    bert_model_name="bert-base-cased",
-    sentence_transformer_name="all-MiniLM-L6-v2"
-)
-
-generator = ParallelBERTGenerator(config, model_config)
-
-# Generate text
-for token in generator.generate_stream("The quick brown fox", num_tokens=50):
-    print(token, end="", flush=True)
-```
 
 ## Configuration
 
@@ -76,6 +44,7 @@ for token in generator.generate_stream("The quick brown fox", num_tokens=50):
 - Located in `config/prompts.yaml`
 - Contains system and reflection prompts for autonomous chat
 - Customizable conversation templates
+- For defining the autonomous chat system, use the `autoCHATbert.py` script
 
 ## Dependencies
 
@@ -90,7 +59,7 @@ for token in generator.generate_stream("The quick brown fox", num_tokens=50):
 ## Architecture Details
 
 ### Base Models
-- BERT (bert-base-uncased/cased)
+- BERT (bert-base-uncased/cased) (Supports other models, fuck around and find out which is the most coherent)
 - Sentence Transformer (all-MiniLM-L6-v2)
 
 ### Custom Components
@@ -113,6 +82,7 @@ python autoCHATbert.py  # Autonomous chat system
 - `/device <cpu|cuda>` - Switch compute device
 - `/stream` - Toggle token streaming
 - `/help` - Show all commands
+- `/tokens <number>` - Set number of tokens to generate (if generations are too long tensors will malform)
 
 ## Logging
 
