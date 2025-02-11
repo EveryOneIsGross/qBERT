@@ -28,6 +28,7 @@ qBERT is a text generation framework for BERT models that explores coherent text
   - Semantic reflection capabilities
   - Vector-based memory search
   - Multi-model conversation orchestration
+  - Per turn hyperparameter tuning with a teacher model
 
 ## Quick Start
 

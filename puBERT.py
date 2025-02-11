@@ -1,4 +1,3 @@
-
 """
 puBERT: A BERT-based text generation model with parallel token generation and coherence checking.
 Version: 0.1
@@ -22,6 +21,10 @@ Dependencies:
 - Sentence-Transformers
 """
 
+import warnings
+# Must import warnings first and set filters before other imports
+warnings.filterwarnings('ignore')  # Suppress all warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,9 +36,19 @@ from sentence_transformers import SentenceTransformer
 from torch.nn import CrossEntropyLoss
 import string
 import sys
+import transformers
+transformers.logging.set_verbosity_error()  # Only show errors, not warnings
+
+@dataclass
+class ModelConfig:
+    bert_model_name: str = 'bert-base-cased'
+    tokenizer_name: str = 'bert-base-cased'
+    sentence_transformer_name: str = 'all-MiniLM-L6-v2'
+    attn_implementation: str = 'sdpa'
 
 @dataclass
 class GenerationConfig:
+
     max_length: int
     batch_size: int
     num_candidates: int
@@ -47,16 +60,22 @@ class GenerationConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 class ParallelBERTGenerator(nn.Module):
-    def __init__(self, config: GenerationConfig):
+    def __init__(self, config: GenerationConfig, model_config: Optional[ModelConfig] = None):
         super().__init__()
         self.config = config
         
+        # Use model_config if provided, otherwise use defaults
+        model_config = model_config or ModelConfig()
+        
         # Initialize BERT model for masked prediction
-        self.bert_model = BertForMaskedLM.from_pretrained('bert-base-cased')
-        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-cased')
+        self.bert_model = BertForMaskedLM.from_pretrained(
+            model_config.bert_model_name,
+            attn_implementation=model_config.attn_implementation
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_config.tokenizer_name)
         
         # Initialize sentence transformer for semantic coherence
-        self.sentence_transformer = SentenceTransformer('all-MiniLM-L6-v2')
+        self.sentence_transformer = SentenceTransformer(model_config.sentence_transformer_name)
         
         # Move models to device
         self.bert_model = self.bert_model.to(config.device)

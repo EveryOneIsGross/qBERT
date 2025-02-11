@@ -69,6 +69,8 @@ from transformers import AutoTokenizer, BertForMaskedLM
 from sentence_transformers import SentenceTransformer
 import sys
 from pydantic import BaseModel, Field
+import transformers
+transformers.logging.set_verbosity_error()  # Only show errors, not warnings
 
 @dataclass
 class GenerationConfig:
@@ -77,12 +79,18 @@ class GenerationConfig:
     num_candidates: int
     embedding_dim: int
     context_window: int = 5
+    phrase_window: int = None  # Add this
     base_temperature: float = 1.0
     min_threshold: float = 0.5
     top_k: int = 50
     compression_ratio: float = 0.5
     max_cache_size: int = 3
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def __post_init__(self):
+        # Default phrase_window to context_window // 2 if not set
+        if self.phrase_window is None:
+            self.phrase_window = max(32, self.context_window // 2)
 
 class ModelConfig(BaseModel):
     """Configuration for transformer models used in qBERT"""
@@ -367,10 +375,10 @@ class ParallelBERTGenerator(nn.Module):
 
     def calculate_coherence_scores(self, 
                                 candidates: List[str],
-                                context: str,
-                                phrase_window: int = 3) -> torch.Tensor:
+                                context: str) -> torch.Tensor:
+        """Calculate coherence scores using configured phrase window."""
         with torch.no_grad():
-            context_tokens = self.tokenizer.tokenize(context)[-phrase_window:]
+            context_tokens = self.tokenizer.tokenize(context)[-self.config.phrase_window:]
             
             # Add length-based penalty for single tokens
             length_penalties = torch.tensor([

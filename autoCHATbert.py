@@ -1,3 +1,7 @@
+import warnings
+# Must import warnings first and set filters before other imports
+warnings.filterwarnings('ignore')
+
 import sys
 import torch
 from typing import Union, Optional, Dict, Any, List, Tuple
@@ -17,6 +21,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import tiktoken  # Add to imports
 import asyncio
 import pickle
+
 
 class ConversationEntry(BaseModel):
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
@@ -344,6 +349,277 @@ class OllamaChat:
         embedding = await self.generate_embedding(text)
         return self.vector_index.search(embedding)
 
+class TeacherFeedback(BaseModel):
+    """Structured feedback from teacher agent for hyperparameter tuning"""
+    base_temperature: float = Field(ge=0.1, le=2.0, description="Controls randomness in generation")
+    min_threshold: float = Field(ge=0.1, le=1.0, description="Token filtering threshold")
+    top_k: int = Field(ge=1, le=100, description="Number of candidate tokens")
+    context_window: int = Field(ge=16, le=512, description="Context window size")
+    notes: str = Field(default="", description="Explanation of adjustments")
+    confidence: float = Field(ge=0.0, le=1.0, description="Confidence in recommendations")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "base_temperature": 0.7,
+                "min_threshold": 0.5,
+                "top_k": 32,
+                "context_window": 256,
+                "notes": "Adjusted for better coherence",
+                "confidence": 0.8
+            }
+        }
+
+# Add these new models for tracking history
+class ParameterUpdate(BaseModel):
+    """Record of a single parameter update"""
+    parameter: str
+    old_value: Any
+    new_value: Any
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+
+class TeacherHistory(BaseModel):
+    """Historical context of teacher suggestions and parameter changes"""
+    suggestion: TeacherFeedback
+    applied_updates: List[ParameterUpdate]
+    configuration: Dict[str, Any]  # Renamed from model_config
+    generation_quality: Dict[str, float] = Field(default_factory=dict)
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+
+class TeacherAgent:
+    """Evaluates BERT output and suggests hyperparameter adjustments"""
+    
+    def __init__(self, 
+                 ollama_client: Any,
+                 model_name: str = "mistral:latest",
+                 min_confidence: float = 0.6,
+                 logger: Optional[Logger] = None,
+                 history_size: int = 5):
+        self.client = ollama_client
+        self.model_name = model_name
+        self.min_confidence = min_confidence
+        self.logger = logger or Logger()
+        self.history_size = history_size
+        self.history: List[TeacherHistory] = []
+        
+        # Load teacher prompt template with fallback
+        try:
+            with open("config/prompts.yaml") as f:
+                prompts = yaml.safe_load(f)
+                self.evaluation_prompt = prompts.get("teacher_evaluation_prompt")
+                if not self.evaluation_prompt:
+                    raise ValueError("Teacher prompt not found in prompts.yaml")
+        except Exception as e:
+            print(f"{Fore.YELLOW}Warning: Could not load teacher prompt: {e}{Style.RESET_ALL}")
+            self.evaluation_prompt = """
+                Analyze this text and suggest parameter updates as JSON:
+                Generated text: {generated_text}
+                Context: {context}
+                Return valid JSON with: base_temperature (0.1-2.0), min_threshold (0.1-1.0),
+                top_k (1-100), context_window (16-512), notes (str), confidence (0-1)
+            """
+    
+    def _format_history_context(self) -> str:
+        """Format historical context for the prompt"""
+        if not self.history:
+            return "No previous adjustments."
+            
+        context = ["Previous adjustments and their effects:"]
+        
+        for entry in self.history[-self.history_size:]:
+            updates = [f"{u.parameter}: {u.old_value} → {u.new_value}" 
+                      for u in entry.applied_updates]
+            
+            context.append(f"\nTimestamp: {entry.timestamp}")
+            context.append(f"Suggestion: {entry.suggestion.notes}")
+            context.append(f"Changes: {', '.join(updates) if updates else 'No changes applied'}")
+            if entry.generation_quality:
+                metrics = [f"{k}: {v:.2f}" for k, v in entry.generation_quality.items()]
+                context.append(f"Quality Metrics: {', '.join(metrics)}")
+            
+        return "\n".join(context)
+    
+    async def evaluate_and_update(self, 
+                                generator: Union[puBERTGenerator, qBERTGenerator],
+                                bert_response: str,
+                                context: str,
+                                model_type: str) -> Tuple[TeacherFeedback, bool]:
+        """Evaluate output and update model parameters if confidence is high enough"""
+        
+        current_config = {
+            param: getattr(generator.config, param)
+            for param in TeacherFeedback.__fields__.keys()
+            if hasattr(generator.config, param)
+        }
+        
+        quality_metrics = self._calculate_quality_metrics(bert_response, context)
+        
+        # Get feedback with historical context
+        feedback = await self._get_feedback(
+            generated_text=bert_response,
+            context=context,
+            current_config=current_config,
+            history_context=self._format_history_context()
+        )
+        
+        # Log the evaluation - currently only logs the result
+        self.logger.log_context({
+            "type": "teacher_evaluation",
+            "model_type": model_type,
+            "bert_response": bert_response,
+            "context": context,
+            "current_config": current_config,
+            "quality_metrics": quality_metrics,
+            "feedback": feedback.dict()
+        })
+        
+        # Track applied updates
+        applied_updates: List[ParameterUpdate] = []
+        updated = False
+        
+        # Only update if confidence exceeds threshold
+        if feedback.confidence >= self.min_confidence:
+            updated = await self._update_parameters(
+                generator, feedback, model_type, applied_updates
+            )
+        
+        # Record this evaluation in history
+        history_entry = TeacherHistory(
+            suggestion=feedback,
+            applied_updates=applied_updates,
+            configuration=current_config,  # Updated to match new field name
+            generation_quality=quality_metrics
+        )
+        self.history.append(history_entry)
+        
+        # Maintain history size
+        if len(self.history) > self.history_size:
+            self.history = self.history[-self.history_size:]
+        
+        return feedback, updated
+    
+    def _calculate_quality_metrics(self, text: str, context: str) -> Dict[str, float]:
+        """Calculate basic quality metrics for the generated text"""
+        try:
+            # Length ratio (generated/context)
+            length_ratio = len(text.split()) / max(len(context.split()), 1)
+            
+            # Repetition score (lower is better)
+            words = text.lower().split()
+            unique_ratio = len(set(words)) / max(len(words), 1)
+            
+            # Punctuation ratio
+            punct_ratio = len([c for c in text if c in '.,!?;:']) / max(len(text), 1)
+            
+            return {
+                "length_ratio": length_ratio,
+                "unique_ratio": unique_ratio,
+                "punct_ratio": punct_ratio
+            }
+        except Exception as e:
+            print(f"{Fore.RED}Error calculating metrics: {e}{Style.RESET_ALL}")
+            return {}
+    
+    async def _get_feedback(self, 
+                           generated_text: str, 
+                           context: str,
+                           current_config: Dict[str, Any],
+                           history_context: str) -> TeacherFeedback:
+        """Get structured feedback on generation quality"""
+        
+        prompt = self.evaluation_prompt.format(
+            generated_text=generated_text,
+            context=context,
+            current_config=json.dumps(current_config, indent=2),
+            history_context=history_context
+        )
+        
+        try:
+            # Log input prompt using existing structure
+            self.logger.log_context({
+                "type": "teacher_prompt",
+                "prompt": prompt,
+                "current_config": current_config,
+                "history_context": history_context
+            })
+
+            response = self.client.chat(
+                model=self.model_name,
+                messages=[{
+                    "role": "system",
+                    "content": "You are a teaching assistant. Respond only with valid JSON."
+                }, {
+                    "role": "user",
+                    "content": prompt
+                }]
+            )
+            
+            content = response['message']['content']
+            json_str = re.search(r'\{.*\}', content, re.DOTALL)
+            if not json_str:
+                raise ValueError("No JSON found in response")
+                
+            feedback_dict = json.loads(json_str.group())
+            feedback = TeacherFeedback(**feedback_dict)
+            
+            # Log response using the TeacherFeedback object
+            self.logger.log_context({
+                "type": "teacher_response",
+                "raw_response": content,
+                "feedback": feedback.dict(),
+                "model_name": self.model_name
+            })
+            
+            return feedback
+            
+        except Exception as e:
+            print(f"{Fore.RED}Teacher evaluation failed: {str(e)}{Style.RESET_ALL}")
+            return TeacherFeedback(
+                base_temperature=0.7,
+                min_threshold=0.5,
+                top_k=32,
+                context_window=256,
+                notes="Failed to get feedback, using defaults",
+                confidence=0.0
+            )
+    
+    async def _update_parameters(self,
+                               generator: Union[puBERTGenerator, qBERTGenerator],
+                               feedback: TeacherFeedback,
+                               model_type: str,
+                               applied_updates: List[ParameterUpdate]) -> bool:
+        """Apply parameter updates to the generator"""
+        try:
+            updates = feedback.dict(exclude={'notes', 'confidence'})
+            for param, value in updates.items():
+                try:
+                    old_value = getattr(generator.config, param)
+                    generator = update_config(generator, param, str(value))
+                    
+                    # Record the update
+                    applied_updates.append(ParameterUpdate(
+                        parameter=param,
+                        old_value=old_value,
+                        new_value=value
+                    ))
+                    
+                    # Log the update
+                    self.logger.log_system_update(SystemUpdate(
+                        update_type=param,
+                        previous_value=old_value,
+                        new_value=value,
+                        model_type=model_type
+                    ))
+                    
+                    print(f"{Fore.YELLOW}Updated {param}: {old_value} → {value}{Style.RESET_ALL}")
+                except Exception as e:
+                    print(f"{Fore.RED}Failed to update {param}: {e}{Style.RESET_ALL}")
+            return True
+            
+        except Exception as e:
+            print(f"{Fore.RED}Parameter update failed: {str(e)}{Style.RESET_ALL}")
+            return False
+
 def create_generator(model_type: str = "qbert", 
                     config: Optional[Union[puBERTConfig, qBERTConfig]] = None,
                     model_config: Optional[ModelConfig] = None):
@@ -503,7 +779,7 @@ async def process_exchange(bert_response: str, ollama_chat: OllamaChat):
 
 async def main():
     """Initialize models and run autonomous chat interface"""
-    num_tokens = 256
+    num_tokens = 64
     stream_mode = True
     model_type = "qbert"
     
@@ -557,6 +833,23 @@ async def main():
                 ))
                 
                 print(Style.RESET_ALL)
+                
+                # Add teacher evaluation here
+                teacher = TeacherAgent(
+                    ollama_client=ollama_chat.client,
+                    model_name=ollama_chat.model_name,
+                    logger=logger
+                )
+                
+                feedback, updated = await teacher.evaluate_and_update(
+                    generator=generator,
+                    bert_response=bert_response,
+                    context="\n".join(auto_chat.conversation_history[-4:]),
+                    model_type=model_type
+                )
+                
+                if updated:
+                    print(f"\n{Fore.CYAN}Teacher Notes: {feedback.notes}{Style.RESET_ALL}")
                 
                 # 2. Generate Reflection & Embedding
 

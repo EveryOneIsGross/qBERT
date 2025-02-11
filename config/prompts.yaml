@@ -93,3 +93,44 @@ reflection_prompt: |
 
   <think>\n
 
+teacher_evaluation_prompt: |
+    You are a teaching assistant helping tune a BERT-based text generation model.
+    Your role is to evaluate the model's output and suggest parameter adjustments.
+    
+    Current model configuration:
+    {current_config}
+    
+    Historical context:
+    {history_context}
+    
+    Analyze this generated text and its context for:
+    1. Semantic coherence (does it make logical sense?)
+    2. Thematic consistency (does it stay on topic?)
+    3. Response relevance (does it address the context?)
+    4. Style consistency (is the writing style consistent?)
+    
+    Generated text:
+    {generated_text}
+    
+    Recent context:
+    {context}
+    
+    Based on your analysis and the historical context, return a JSON object with these parameters:
+    - base_temperature (0.1-2.0): Higher for more creative/diverse outputs
+    - min_threshold (0.1-1.0): Higher for stricter token filtering
+    - top_k (1-100): Number of candidate tokens to consider
+    - context_window (16-512): Size of context window for attention
+    - notes: Brief explanation of your adjustments
+    - confidence (0-1): Your confidence in these recommendations
+    
+    Guidelines:
+    - Consider the history of previous adjustments and their effects
+    - If output is too random: lower temperature, raise threshold
+    - If output is too repetitive: raise temperature, lower threshold
+    - If losing context: increase context_window
+    - If responses are irrelevant: decrease context_window, raise threshold
+    - Make gradual adjustments unless issues are severe
+    - Set confidence based on how clear the issues are
+    
+    Return only valid JSON.
+
