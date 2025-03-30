@@ -220,14 +220,27 @@ def main():
                         model_name = parts[1].strip('"')
                         old_model = model_config.bert_model_name
                         
-                        # Update config and recreate generator
+                        # Preserve existing config settings
+                        current_config = {k: v for k, v in vars(generator.config).items() 
+                                         if k in ['max_length', 'batch_size', 'num_candidates', 
+                                                'embedding_dim', 'context_window', 'base_temperature',
+                                                'min_threshold', 'top_k', 'device']}
+                        
+                        # Create new model config while preserving other settings
                         new_config = ModelConfig(
                             bert_model_name=model_name,
                             tokenizer_name=model_name,
                             sentence_transformer_name=model_config.sentence_transformer_name,
                             attn_implementation=model_config.attn_implementation
                         )
-                        generator = create_generator(model_type, model_config=new_config)
+                        
+                        # Create new generator with preserved settings
+                        if model_type == 'pubert':
+                            config = puBERTConfig(**current_config)
+                        else:
+                            config = qBERTConfig(**current_config)
+                            
+                        generator = create_generator(model_type, config=config, model_config=new_config)
                         model_config = new_config
                         
                         logger.log_system_update(SystemUpdate(
@@ -236,7 +249,7 @@ def main():
                             new_value=model_name,
                             model_type=model_type
                         ))
-                        print(f"{Fore.GREEN}Switched BERT model to {model_name}{Style.RESET_ALL}")
+                        print(f"{Fore.GREEN}Switched BERT model to {model_name} with preserved settings{Style.RESET_ALL}")
                     except Exception as e:
                         print(f"{Fore.RED}Error switching BERT model: {str(e)}{Style.RESET_ALL}")
                     continue
@@ -249,13 +262,26 @@ def main():
                         model_name = parts[1]
                         old_model = model_config.sentence_transformer_name
                         
+                        # Preserve existing config settings
+                        current_config = {k: v for k, v in vars(generator.config).items() 
+                                         if k in ['max_length', 'batch_size', 'num_candidates', 
+                                                'embedding_dim', 'context_window', 'base_temperature',
+                                                'min_threshold', 'top_k', 'device']}
+                        
                         new_config = ModelConfig(
                             bert_model_name=model_config.bert_model_name,
                             tokenizer_name=model_config.tokenizer_name,
                             sentence_transformer_name=model_name,
                             attn_implementation=model_config.attn_implementation
                         )
-                        generator = create_generator(model_type, model_config=new_config)
+                        
+                        # Create new generator with preserved settings
+                        if model_type == 'pubert':
+                            config = puBERTConfig(**current_config)
+                        else:
+                            config = qBERTConfig(**current_config)
+                            
+                        generator = create_generator(model_type, config=config, model_config=new_config)
                         model_config = new_config
                         
                         logger.log_system_update(SystemUpdate(
@@ -264,7 +290,7 @@ def main():
                             new_value=model_name,
                             model_type=model_type
                         ))
-                        print(f"{Fore.GREEN}Switched sentence transformer to {model_name}{Style.RESET_ALL}")
+                        print(f"{Fore.GREEN}Switched sentence transformer to {model_name} with preserved settings{Style.RESET_ALL}")
                     except Exception as e:
                         print(f"{Fore.RED}Error switching sentence transformer: {str(e)}{Style.RESET_ALL}")
                     continue
@@ -277,13 +303,26 @@ def main():
                         impl_type = parts[1]
                         old_impl = model_config.attn_implementation
                         
+                        # Preserve existing config settings
+                        current_config = {k: v for k, v in vars(generator.config).items() 
+                                         if k in ['max_length', 'batch_size', 'num_candidates', 
+                                                'embedding_dim', 'context_window', 'base_temperature',
+                                                'min_threshold', 'top_k', 'device']}
+                        
                         new_config = ModelConfig(
                             bert_model_name=model_config.bert_model_name,
                             tokenizer_name=model_config.tokenizer_name,
                             sentence_transformer_name=model_config.sentence_transformer_name,
                             attn_implementation=impl_type
                         )
-                        generator = create_generator(model_type, model_config=new_config)
+                        
+                        # Create new generator with preserved settings
+                        if model_type == 'pubert':
+                            config = puBERTConfig(**current_config)
+                        else:
+                            config = qBERTConfig(**current_config)
+                            
+                        generator = create_generator(model_type, config=config, model_config=new_config)
                         model_config = new_config
                         
                         logger.log_system_update(SystemUpdate(
@@ -292,7 +331,7 @@ def main():
                             new_value=impl_type,
                             model_type=model_type
                         ))
-                        print(f"{Fore.GREEN}Switched attention implementation to {impl_type}{Style.RESET_ALL}")
+                        print(f"{Fore.GREEN}Switched attention implementation to {impl_type} with preserved settings{Style.RESET_ALL}")
                     except Exception as e:
                         print(f"{Fore.RED}Error switching attention implementation: {str(e)}{Style.RESET_ALL}")
                     continue
@@ -303,15 +342,26 @@ def main():
                         if len(parts) != 2:
                             print(f"{Fore.RED}Please provide a value for {command}{Style.RESET_ALL}")
                             continue
+                            
+                        # Preserve model config settings
+                        new_config = ModelConfig(
+                            bert_model_name=model_config.bert_model_name,
+                            tokenizer_name=model_config.tokenizer_name,
+                            sentence_transformer_name=model_config.sentence_transformer_name,
+                            attn_implementation=model_config.attn_implementation
+                        )
+                        
                         old_config = vars(generator.config).copy()
                         generator = update_config(generator, command, parts[1])
+                        generator = create_generator(model_type, config=generator.config, model_config=new_config)
+                        
                         logger.log_system_update(SystemUpdate(
                             update_type="config",
                             previous_value=old_config[command],
                             new_value=parts[1],
                             model_type=model_type
                         ))
-                        print(f"{Fore.GREEN}Updated {command} to {parts[1]}{Style.RESET_ALL}")
+                        print(f"{Fore.GREEN}Updated {command} to {parts[1]} with preserved model settings{Style.RESET_ALL}")
                         continue
                     except (ValueError, KeyError) as e:
                         print(f"{Fore.RED}Error: {str(e)}{Style.RESET_ALL}")

@@ -85,7 +85,15 @@ class GenerationConfig:
     top_k: int = 50
     compression_ratio: float = 0.5
     max_cache_size: int = 3
+    sequence_cache_size: int = 5
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Toggle mechanisms
+    use_semantic_memory: bool = True
+    use_bidirectional_context: bool = True
+    use_adaptive_temperature: bool = True
+    use_coherence_scoring: bool = True
+    use_sequence_memory: bool = True
 
     def __post_init__(self):
         # Default phrase_window to context_window // 2 if not set
@@ -140,6 +148,10 @@ class SemanticMemoryCache:
     def influence_new_generation(self, current_matrix: torch.Tensor, 
                                context_key: str) -> torch.Tensor:
         """Blend previous semantic space with current if available."""
+        # Skip if semantic memory is disabled
+        if not self.config.use_semantic_memory:
+            return current_matrix
+            
         if context_key not in self.semantic_memory:
             return current_matrix
             
@@ -157,6 +169,10 @@ class SemanticMemoryCache:
         
     def update_memory(self, matrix: torch.Tensor, context_key: str):
         """Update semantic memory with new compressed representation."""
+        # Skip if semantic memory is disabled
+        if not self.config.use_semantic_memory:
+            return
+            
         if len(self.semantic_memory) >= self.config.max_cache_size:
             # Remove oldest entry if at capacity
             oldest_key = next(iter(self.semantic_memory))
@@ -164,6 +180,85 @@ class SemanticMemoryCache:
             
         compressed = self.compress_4d_space(matrix)
         self.semantic_memory[context_key] = compressed
+
+class SequenceMemoryCache:
+    """Caches and retrieves complete text sequences for better coherence and recollection."""
+    
+    def __init__(self, config: GenerationConfig, sentence_transformer: SentenceTransformer):
+        self.config = config
+        self.sentence_transformer = sentence_transformer
+        self.sequence_memory: Dict[str, List[Dict[str, Union[str, torch.Tensor]]]] = {}
+        self.similarity_threshold = 0.7
+        
+    def encode_sequence(self, text: str) -> torch.Tensor:
+        """Encode text sequence using sentence transformer."""
+        with torch.no_grad():
+            embeddings = self.sentence_transformer.encode(text, convert_to_tensor=True)
+            return embeddings.to(self.config.device)
+    
+    def add_sequence(self, context_key: str, generated_text: str):
+        """Add a generated sequence to the memory cache."""
+        if not self.config.use_sequence_memory:
+            return
+            
+        # Initialize memory for this context if it doesn't exist
+        if context_key not in self.sequence_memory:
+            self.sequence_memory[context_key] = []
+            
+        # Encode the sequence
+        embedding = self.encode_sequence(generated_text)
+        
+        # Add to memory
+        self.sequence_memory[context_key].append({
+            "text": generated_text,
+            "embedding": embedding
+        })
+        
+        # Limit memory size per context
+        if len(self.sequence_memory[context_key]) > self.config.sequence_cache_size:
+            self.sequence_memory[context_key].pop(0)  # Remove oldest
+            
+        # Limit total contexts
+        if len(self.sequence_memory) > self.config.max_cache_size:
+            # Remove oldest context
+            oldest_key = next(iter(self.sequence_memory))
+            del self.sequence_memory[oldest_key]
+    
+    def retrieve_similar_sequences(self, query: str, context_key: str = None) -> List[str]:
+        """Retrieve sequences similar to the query."""
+        if not self.config.use_sequence_memory:
+            return []
+            
+        query_embedding = self.encode_sequence(query)
+        similar_sequences = []
+        
+        # Helper to calculate similarity and filter
+        def process_sequences(sequences):
+            results = []
+            for seq in sequences:
+                similarity = F.cosine_similarity(
+                    query_embedding.unsqueeze(0),
+                    seq["embedding"].unsqueeze(0),
+                    dim=1
+                ).item()
+                
+                if similarity > self.similarity_threshold:
+                    results.append({"text": seq["text"], "similarity": similarity})
+            return results
+            
+        # If context_key provided, only search in that context
+        if context_key and context_key in self.sequence_memory:
+            similar_sequences = process_sequences(self.sequence_memory[context_key])
+        else:
+            # Search across all contexts
+            for context_sequences in self.sequence_memory.values():
+                similar_sequences.extend(process_sequences(context_sequences))
+                
+        # Sort by similarity (highest first)
+        similar_sequences.sort(key=lambda x: x["similarity"], reverse=True)
+        
+        # Return just the text
+        return [seq["text"] for seq in similar_sequences]
 
 class PunctuationHandler:
     """Handles text formatting rules for punctuation and spacing."""
@@ -234,7 +329,10 @@ class ParallelBERTGenerator(nn.Module):
             attn_implementation=model_config.attn_implementation
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_config.tokenizer_name)
-        self.sentence_transformer = SentenceTransformer(model_config.sentence_transformer_name)
+        self.sentence_transformer = SentenceTransformer(
+            model_config.sentence_transformer_name,
+            trust_remote_code=True
+        )
         
         # Move models to device and eval mode
         self.bert_model = self.bert_model.to(config.device)
@@ -248,6 +346,9 @@ class ParallelBERTGenerator(nn.Module):
         
         # Initialize semantic memory cache
         self.semantic_memory = SemanticMemoryCache(config)
+        
+        # Initialize sequence memory cache
+        self.sequence_memory = SequenceMemoryCache(config, self.sentence_transformer)
         
         # Store the formatter based on tokenizer type
         self.token_formatter = PunctuationHandler.create_formatter(self.tokenizer.name_or_path)
@@ -264,49 +365,81 @@ class ParallelBERTGenerator(nn.Module):
                             mask_positions: List[int]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Get batched BERT predictions for masked positions."""
         with torch.no_grad():
-            outputs = self.bert_model(input_ids, attention_mask=attention_mask)
+            # Ensure the mask token is correctly set at the specified positions
+            masked_input_ids = input_ids.clone()
+            for batch_idx in range(input_ids.size(0)):
+                masked_input_ids[batch_idx, mask_positions[batch_idx]] = self.tokenizer.mask_token_id
+                
+            # Get BERT predictions
+            outputs = self.bert_model(masked_input_ids, attention_mask=attention_mask)
             predictions = outputs.logits  # [batch_size, seq_len, vocab_size]
             
+            # Create a mask for valid tokens (exclude special tokens)
             valid_tokens = torch.ones(predictions.size(-1), device=self.config.device).bool()
             special_tokens = {self.tokenizer.pad_token_id, self.tokenizer.cls_token_id,
                              self.tokenizer.sep_token_id, self.tokenizer.mask_token_id,
                              self.tokenizer.unk_token_id}
+            # Filter out None values that might occur if a token doesn't exist
+            special_tokens = {token for token in special_tokens if token is not None}
             valid_tokens[list(special_tokens)] = False
             
             masked_predictions = []
             for batch_idx in range(input_ids.size(0)):
+                # Get logits for the masked position
                 logits = predictions[batch_idx, mask_positions[batch_idx]]
+                
+                # Set invalid tokens to negative infinity to exclude them from sampling
                 logits[~valid_tokens] = float('-inf')
-                top_k_logits, top_k_indices = torch.topk(logits, self.config.top_k)
+                
+                # Get top-k predictions
+                top_k_logits, top_k_indices = torch.topk(logits, min(self.config.top_k, (valid_tokens.sum().item())))
                 masked_predictions.append((top_k_logits, top_k_indices))
             
             return masked_predictions
 
     def create_4d_matrix(self, initial_text: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """Initialize the 4D generation matrix with batched BERT embeddings."""
+        # Handle empty initial text
+        if not initial_text:
+            initial_text = " "  # Use a space as minimal input
+            
+        # Tokenize the initial text
         tokens = self.tokenizer([initial_text] * self.config.batch_size, 
                               return_tensors="pt", 
-                              padding=True)
+                              padding=True,
+                              truncation=True,
+                              max_length=512)  # Add max_length to prevent excessive sequences
         input_ids = tokens['input_ids'].to(self.config.device)
         attention_mask = tokens['attention_mask'].to(self.config.device)
         
+        # Calculate total matrix size (initial sequence + tokens to generate)
+        seq_len = input_ids.size(1)
+        total_length = seq_len + self.config.max_length
+        
+        # Initialize the 4D matrix
         matrix = torch.zeros(
-            (len(input_ids[0]) + self.config.max_length,
+            (total_length,
              self.config.batch_size,
              self.config.num_candidates, 
              self.config.embedding_dim),
             device=self.config.device
         )
         
+        # Get BERT embeddings for the initial text
         with torch.no_grad():
             outputs = self.bert_model.bert(input_ids, attention_mask=attention_mask)
             embeddings = outputs.last_hidden_state  # [batch_size, seq_len, embedding_dim]
+            
+            # Fill the matrix with initial embeddings
             for batch_idx in range(self.config.batch_size):
-                seq_len = attention_mask[batch_idx].sum()
-                matrix[:seq_len, batch_idx, 0, :] = embeddings[batch_idx, :seq_len]
+                seq_len = attention_mask[batch_idx].sum().item()
+                if seq_len > 0:  # Ensure we have valid tokens
+                    matrix[:seq_len, batch_idx, 0, :] = embeddings[batch_idx, :seq_len]
         
-        context_key = initial_text[:50]
-        matrix = self.semantic_memory.influence_new_generation(matrix, context_key)
+        # Apply semantic memory influence if enabled
+        context_key = initial_text[:50]  # Use a prefix to avoid long keys
+        if self.config.use_semantic_memory:
+            matrix = self.semantic_memory.influence_new_generation(matrix, context_key)
         
         return matrix, input_ids
 
@@ -318,6 +451,10 @@ class ParallelBERTGenerator(nn.Module):
         """Process context using batched bidirectional and cross attention."""
         batch_size = embeddings.shape[0]
         matrix_size = matrix.shape[0]
+        
+        # If bidirectional context is disabled, return embeddings as is
+        if not self.config.use_bidirectional_context:
+            return embeddings
         
         # Safely calculate context windows
         start_idx = max(0, position - window_size)
@@ -377,8 +514,18 @@ class ParallelBERTGenerator(nn.Module):
                                 candidates: List[str],
                                 context: str) -> torch.Tensor:
         """Calculate coherence scores using configured phrase window."""
+        if not candidates:
+            return torch.tensor([], device=self.config.device)
+            
         with torch.no_grad():
-            context_tokens = self.tokenizer.tokenize(context)[-self.config.phrase_window:]
+            # Limit context to the phrase window to avoid excessive computation
+            if len(context) > 0:
+                # Use tokenizer to get the last N tokens from context
+                context_tokens = self.tokenizer.tokenize(context)[-self.config.phrase_window:]
+                context_text = self.tokenizer.convert_tokens_to_string(context_tokens)
+            else:
+                context_text = ""
+                context_tokens = []
             
             # Add length-based penalty for single tokens
             length_penalties = torch.tensor([
@@ -386,51 +533,117 @@ class ParallelBERTGenerator(nn.Module):
                 for candidate in candidates
             ], device=self.config.device)
             
-            candidate_phrases = [
-                self.tokenizer.convert_tokens_to_string(context_tokens + [candidate]) 
-                for candidate in candidates
-            ]
+            # Create candidate phrases by combining context with each candidate
+            candidate_phrases = []
+            for candidate in candidates:
+                if context_tokens:
+                    phrase = self.tokenizer.convert_tokens_to_string(context_tokens + [candidate])
+                else:
+                    phrase = candidate
+                candidate_phrases.append(phrase)
             
-            phrase_embeddings = self.encode_sequence(candidate_phrases)
-            context_embedding = self.encode_sequence(context)
+            # Handle empty context case
+            if not context_text:
+                # If no context, just return length penalties as scores
+                return length_penalties
             
-            similarity = F.cosine_similarity(
-                phrase_embeddings.unsqueeze(1),
-                context_embedding.unsqueeze(0),
-                dim=-1
-            )
+            # Check sequence memory for similar sequences
+            if self.config.use_sequence_memory:
+                context_key = context_text[:50]  # Use prefix as key
+                similar_sequences = self.sequence_memory.retrieve_similar_sequences(context_text, context_key)
+                
+                # If we found similar sequences, boost candidates that appear in them
+                if similar_sequences:
+                    sequence_boost = torch.ones(len(candidates), device=self.config.device)
+                    for i, candidate in enumerate(candidates):
+                        for sequence in similar_sequences:
+                            if candidate in sequence:
+                                sequence_boost[i] *= 1.2  # Boost by 20%
+                                break
+                    
+                    # Apply boosting to length penalties
+                    length_penalties *= sequence_boost
             
-            # Apply length penalty to similarity scores
-            return similarity * length_penalties
+            # Calculate embeddings and similarity
+            try:
+                phrase_embeddings = self.encode_sequence(candidate_phrases)
+                context_embedding = self.encode_sequence(context_text)
+                
+                similarity = F.cosine_similarity(
+                    phrase_embeddings,
+                    context_embedding.unsqueeze(0).expand(len(candidates), -1),
+                    dim=-1
+                )
+                
+                # Apply length penalty to similarity scores
+                return similarity * length_penalties
+            except Exception as e:
+                # Fallback to uniform scores if embedding fails
+                print(f"Warning: Coherence scoring failed with error: {e}")
+                return torch.ones(len(candidates), device=self.config.device)
 
     def coherence_based_sampling(self, 
                                candidates: torch.Tensor,
                                coherence_scores: torch.Tensor,
                                bert_scores: torch.Tensor) -> torch.Tensor:
         """Sample tokens based on combined BERT and coherence scores."""
+        # Handle empty candidates case
+        if len(candidates) == 0:
+            return torch.tensor(0, device=self.config.device)
+            
+        # Ensure all tensors have the same length
+        min_len = min(len(candidates), len(coherence_scores), len(bert_scores))
+        candidates = candidates[:min_len]
+        coherence_scores = coherence_scores[:min_len]
+        bert_scores = bert_scores[:min_len]
+        
         # Increase threshold for single-token candidates
         single_token_mask = torch.tensor([
             0.8 if len(self.tokenizer.convert_ids_to_tokens([idx.item()])[0]) <= 4 else 1.0
             for idx in candidates
         ], device=self.config.device)
         
+        # Normalize scores to prevent numerical issues
+        bert_scores = F.softmax(bert_scores, dim=-1)
+        coherence_scores = torch.clamp(coherence_scores, min=0.1, max=1.0)
+        
         combined_scores = bert_scores * coherence_scores * single_token_mask
         
-        mean_coherence = torch.mean(coherence_scores)
-        temperature = self.config.base_temperature * (1 / mean_coherence)
-        temperature = torch.clamp(temperature, min=0.1, max=2.0)
+        # Apply adaptive temperature if enabled, otherwise use base temperature
+        if self.config.use_adaptive_temperature:
+            mean_coherence = torch.mean(coherence_scores)
+            temperature = self.config.base_temperature * (1 / mean_coherence)
+            temperature = torch.clamp(temperature, min=0.1, max=2.0)
+        else:
+            temperature = self.config.base_temperature
         
+        # Apply threshold filtering
         threshold = torch.mean(combined_scores) * self.config.min_threshold
         valid_candidates = combined_scores > threshold
         
+        # If no candidates pass the threshold, use all candidates
         if not torch.any(valid_candidates):
             valid_candidates = torch.ones_like(combined_scores, dtype=torch.bool)
         
+        # Apply temperature and sample
         scaled_scores = combined_scores[valid_candidates] / temperature
-        probs = F.softmax(scaled_scores, dim=-1)
-        sample_idx = torch.multinomial(probs, num_samples=1)
-        valid_indices = torch.where(valid_candidates)[0]
-        selected_idx = valid_indices[sample_idx]
+        
+        # Handle numerical stability
+        max_score = torch.max(scaled_scores)
+        exp_scores = torch.exp(scaled_scores - max_score)
+        probs = exp_scores / torch.sum(exp_scores)
+        
+        # Ensure probs sum to 1
+        probs = probs / torch.sum(probs)
+        
+        # Sample from the distribution
+        try:
+            sample_idx = torch.multinomial(probs, num_samples=1)
+            valid_indices = torch.where(valid_candidates)[0]
+            selected_idx = valid_indices[sample_idx]
+        except RuntimeError:
+            # Fallback to argmax if sampling fails
+            selected_idx = torch.argmax(combined_scores).unsqueeze(0)
         
         return selected_idx.squeeze()
 
@@ -460,21 +673,24 @@ class ParallelBERTGenerator(nn.Module):
         padded_attention_mask[:, :seq_len] = 1
         
         # Setup for generation
-        masked_input_ids = padded_input_ids.clone()
         current_sequences = [input_ids[i].tolist() for i in range(self.config.batch_size)]
         prev_tokens = [None] * self.config.batch_size
+        generated_text = [""] * self.config.batch_size
+        
+        # Retrieve similar sequences if enabled
+        context_key = initial_text[:50]  # Use prefix as key
+        similar_sequences = []
+        if self.config.use_sequence_memory:
+            similar_sequences = self.sequence_memory.retrieve_similar_sequences(initial_text, context_key)
         
         # Generate tokens
         for position in range(seq_len, seq_len + tokens_to_generate):
             # Update attention mask for current position
-            padded_attention_mask[:, :position + 1] = 1
-            
-            # Mask current position for all batches
-            masked_input_ids[:, position] = self.tokenizer.mask_token_id
+            padded_attention_mask[:, position] = 1
             
             # Get batched BERT predictions
             bert_predictions = self.get_bert_predictions(
-                masked_input_ids,
+                padded_input_ids,
                 padded_attention_mask,
                 [position] * self.config.batch_size
             )
@@ -482,7 +698,7 @@ class ParallelBERTGenerator(nn.Module):
             # Get embeddings with bidirectional context for all batches
             with torch.no_grad():
                 outputs = self.bert_model.bert(
-                    input_ids=masked_input_ids,
+                    input_ids=padded_input_ids,
                     attention_mask=padded_attention_mask
                 )
                 current_embeddings = outputs.last_hidden_state[:, position]  # [batch_size, embedding_dim]
@@ -498,11 +714,49 @@ class ParallelBERTGenerator(nn.Module):
                 # Unpack predictions correctly
                 top_k_logits, top_k_indices = bert_predictions[batch_idx]
                 
-                # Get candidate tokens and calculate coherence
+                # Skip if no valid predictions
+                if len(top_k_indices) == 0:
+                    continue
+                
+                # Get candidate tokens
                 candidate_tokens = [self.tokenizer.convert_ids_to_tokens([idx.item()])[0] 
                                  for idx in top_k_indices]
-                context = self.tokenizer.decode(current_sequences[batch_idx])
-                coherence_scores = self.calculate_coherence_scores(candidate_tokens, context)
+                
+                # Calculate coherence scores if enabled, otherwise use uniform scores
+                if self.config.use_coherence_scoring:
+                    context = self.tokenizer.decode(current_sequences[batch_idx])
+                    coherence_scores = self.calculate_coherence_scores(candidate_tokens, context)
+                else:
+                    coherence_scores = torch.ones(len(candidate_tokens), device=self.config.device)
+                
+                # Apply sequence memory influence if enabled
+                if self.config.use_sequence_memory and similar_sequences:
+                    # Calculate position ratio (how far we are in generation)
+                    position_ratio = (position - seq_len) / tokens_to_generate
+                    
+                    # The influence of sequence memory decreases as generation progresses
+                    # This allows the model to diverge more as it generates
+                    sequence_influence = max(0.0, 1.0 - position_ratio)
+                    
+                    # Apply influence to coherence scores
+                    sequence_boost = torch.ones_like(coherence_scores)
+                    
+                    # Current text generated so far
+                    current_text = generated_text[batch_idx]
+                    
+                    for i, token in enumerate(candidate_tokens):
+                        # Check each similar sequence for this token following current context
+                        for seq in similar_sequences:
+                            # Only use sequence context if it contains what we've generated so far
+                            if current_text in seq:
+                                # Find position after our current text
+                                pos = seq.find(current_text) + len(current_text)
+                                if pos < len(seq) and token in seq[pos:pos+len(token)+5]:
+                                    # Boost token that appears in the sequence immediately after our context
+                                    sequence_boost[i] *= (1.0 + 0.3 * sequence_influence)
+                    
+                    # Apply the boost
+                    coherence_scores *= sequence_boost
                 
                 # Sample next token
                 selected_idx = self.coherence_based_sampling(
@@ -513,7 +767,7 @@ class ParallelBERTGenerator(nn.Module):
                 
                 # Update state for this batch
                 selected_token_id = top_k_indices[selected_idx]
-                masked_input_ids[batch_idx, position] = selected_token_id
+                padded_input_ids[batch_idx, position] = selected_token_id
                 current_sequences[batch_idx].append(selected_token_id.item())
                 matrix[position, batch_idx, 0, :] = attended_embeddings[batch_idx]
                 
@@ -521,51 +775,25 @@ class ParallelBERTGenerator(nn.Module):
                 token = self.tokenizer.convert_ids_to_tokens([selected_token_id.item()])[0]
                 formatted = self.token_formatter(token, prev_tokens[batch_idx])
                 if formatted:
+                    generated_text[batch_idx] += formatted
                     yield formatted
                 prev_tokens[batch_idx] = token
         
         # Update semantic memory after generation
-        context_key = initial_text
         self.semantic_memory.update_memory(matrix, context_key)
+        
+        # Update sequence memory with complete generated text
+        if self.config.use_sequence_memory:
+            # Use the first batch's generated text
+            self.sequence_memory.add_sequence(context_key, initial_text + generated_text[0])
 
     def generate(self, initial_text: str, num_tokens: int) -> str:
         """Non-streaming generation function that returns complete text."""
-        return "".join(self.generate_stream(initial_text, num_tokens))
-
-def main():
-    config = GenerationConfig(
-        max_length=100,
-        batch_size=1,
-        num_candidates=50,
-        embedding_dim=768,
-        context_window=5,
-        base_temperature=0.5,
-        min_threshold=0.9,
-        top_k=50,
-        compression_ratio=0.5,
-        max_cache_size=3
-    )
-    
-    model_config = ModelConfig(
-        bert_model_name="bert-base-cased",
-        tokenizer_name="bert-base-cased",
-        sentence_transformer_name="all-MiniLM-L6-v2"
-    )
-    
-    # Initialize generator with both configs
-    parallel_generator = ParallelBERTGenerator(config, model_config)
-    
-    initial_text = "The quick brown fox"
-    num_tokens_to_generate = 10
-    
-    print("\nParallel BERT Generator:")
-    print(f"Input: {initial_text}")
-    print("Generated: ", end="", flush=True)
-    
-    for token in parallel_generator.generate_stream(initial_text, num_tokens_to_generate):
-        sys.stdout.write(token)
-        sys.stdout.flush()
-    print()
-
-if __name__ == "__main__":
-    main()
+        generated_text = "".join(self.generate_stream(initial_text, num_tokens))
+        
+        # Store complete generated text in sequence memory
+        if self.config.use_sequence_memory:
+            context_key = initial_text[:50]  # Use prefix as key
+            self.sequence_memory.add_sequence(context_key, initial_text + generated_text)
+            
+        return generated_text

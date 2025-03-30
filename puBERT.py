@@ -74,8 +74,11 @@ class ParallelBERTGenerator(nn.Module):
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_config.tokenizer_name)
         
-        # Initialize sentence transformer for semantic coherence
-        self.sentence_transformer = SentenceTransformer(model_config.sentence_transformer_name)
+        # Initialize sentence transformer with trust_remote_code=True
+        self.sentence_transformer = SentenceTransformer(
+            model_config.sentence_transformer_name,
+            trust_remote_code=True
+        )
         
         # Move models to device
         self.bert_model = self.bert_model.to(config.device)

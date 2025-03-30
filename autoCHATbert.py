@@ -1,3 +1,8 @@
+"""
+It might not be tracking config states correctly between truns f or the teacher to maintain and update.
+
+"""
+
 import warnings
 # Must import warnings first and set filters before other imports
 warnings.filterwarnings('ignore')
@@ -146,7 +151,7 @@ class OllamaChat:
     def __init__(self, max_history: int = 10, embed_model: str = 'nomic-embed-text', 
                  history_path: str = "data/chat_history.pkl"):
         self.max_history = max_history
-        self.model_name = 'mistral-small:24b'
+        self.model_name = 'qwq'
         self.client = ollama.Client()
         self.embed_model = embed_model
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
