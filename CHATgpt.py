@@ -189,11 +189,31 @@ class ChatbotDemo:
             self.qgpt2_history = self.qgpt2_model.tokenizer.decode(tokens)
     
     def update_config(self, **kwargs):
-        """Update configuration parameters."""
+        """Update configuration parameters and reinitialize model if needed."""
+        updated_params = []
         for key, value in kwargs.items():
             if hasattr(self.gen_config, key):
+                # Store old value for logging
+                old_value = getattr(self.gen_config, key)
+                
+                # Update the config value
                 setattr(self.gen_config, key, value)
-                print(f"Updated {key} to {value}")
+                updated_params.append((key, old_value, value))
+                
+        # Only reinitialize if we actually updated any parameters
+        if updated_params and self.qgpt2_model and self.model_mode in ["qgpt2", "both"]:
+            # Preserve history
+            old_history = self.qgpt2_history
+            
+            # Reinitialize model with new config
+            self.qgpt2_model = SemanticGPT2Generator(self.gen_config, self.model_config)
+            
+            # Restore history
+            self.qgpt2_history = old_history
+            
+            # Print updates
+            for param, old_val, new_val in updated_params:
+                print(f"Updated {param} from {old_val} to {new_val}")
     
     def set_model_mode(self, mode):
         """Change the current model mode."""
@@ -267,7 +287,8 @@ class ChatbotDemo:
                         
                     parts = user_input.split()
                     if len(parts) >= 3:
-                        param = parts[1]
+                        # Normalize parameter name by converting hyphens to underscores
+                        param = parts[1].replace('-', '_')
                         try:
                             # Parse value with appropriate type
                             if parts[2].lower() in ['true', 'false']:
