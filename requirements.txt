@@ -1,0 +1,37 @@
+# Python 3.12-compatible project requirements.
+# Derived from `albert-env`, but trimmed to packages used by this repository.
+# PyTorch is pinned to CUDA 12.1 wheels, verified on an RTX 4090.
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.5.1+cu121
+torchaudio==2.5.1+cu121
+torchvision==0.20.1+cu121
+sympy==1.13.1
+
+transformers==4.46.3
+sentence-transformers==3.2.1
+datasets==3.1.0
+accelerate==1.0.1
+huggingface-hub==0.27.0
+safetensors==0.4.5
+tokenizers==0.20.3
+
+numpy==1.26.4
+scipy==1.14.1
+pandas==2.2.3
+pyarrow==17.0.0
+scikit-learn==1.5.2
+
+pydantic==2.10.4
+PyYAML==6.0.2
+colorama==0.4.6
+tqdm==4.67.1
+tiktoken==0.7.0
+ollama==0.4.5
+tensorboard==2.18.0
+tensorboardX==2.6.2.2
+
+einops==0.8.1
+nltk==3.9.1
+num2words==0.5.14
+Pillow==10.4.0

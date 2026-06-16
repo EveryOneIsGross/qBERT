@@ -1,8 +1,8 @@
 model_defaults:
-  bert_model: "bert-base-uncased"
-  tokenizer: "bert-base-uncased"
-  sentence_transformer: "all-MiniLM-L6-v2"
-  attention_implementation: "eager"
+  bert_model_name: "bert-base-cased"
+  tokenizer_name: "bert-base-cased"
+  sentence_transformer_name: "all-MiniLM-L6-v2"
+  attn_implementation: "eager"
 
 pubert:
   max_length: 1000
@@ -20,8 +20,81 @@ qbert:
   num_candidates: 128
   embedding_dim: 768
   context_window: 256
+  phrase_window: null
   base_temperature: 0.7
   min_threshold: 0.5
   top_k: 32
   compression_ratio: 0.2
-  max_cache_size: 16 
+  max_cache_size: 16
+  sequence_cache_size: 5
+  device: null
+  use_semantic_memory: true
+  use_bidirectional_context: true
+  use_adaptive_temperature: true
+  use_coherence_scoring: true
+  use_sequence_memory: true
+  use_learned_gate: false
+  tau_coherence: 1.7
+  p_nucleus: 0.9
+  repetition_penalty: 0.8
+  repetition_window: 64
+  entity_boost: 1.05
+  use_entity_bias: true
+  gibbs_every_M: 0
+  gibbs_span_L: 0
+  use_space_alignment: false
+  cache_limit: 1024
+  dynamic_window_gamma: 0.0
+  memory_alpha: 0.002
+  memory_beta: 0.15
+  coherence_anchor_alpha: 0.5
+  coherence_anchor_taper: true
+  use_coherence_homeostasis: true
+  coherence_ema_alpha: 0.15
+  coherence_low_threshold: 0.40
+  coherence_high_threshold: 0.65
+  use_entropy_gibbs: true
+  use_denoise: false
+  denoise_passes: 1
+  denoise_top_k: 32
+  denoise_accept_margin: 0.15
+  denoise_temperature: 0.6
+  stream_denoise: true
+  denoise_pattern: "sequential"
+  denoise_batch_size: 32
+
+autochat:
+  pause_duration: 2.0
+  is_paused: false
+  max_context_length: 4096
+  max_chunk_size: 512
+  max_bert_context: 256
+  max_bert_response: 256
+
+autochat_session:
+  num_tokens: 64
+  stream_mode: true
+  model_type: "qbert"
+
+ollama:
+  model_name: "gemma4:12b"
+  embed_model: "nomic-embed-text"
+  max_history: 4
+  history_path: "data/chat_history.pkl"
+  host: null
+
+teacher:
+  use_ollama_model: true
+  model_name: null
+  min_confidence: 0.6
+  history_size: 5
+  bm25_path: "data/hybrid_memory_bm25_index.json"
+  related_attempts: 4
+
+memory:
+  vector_path: "data/vector_index.pkl"
+  bm25_path: "data/hybrid_memory_bm25_index.json"
+  dimension: 1024
+  reflection_backfill_limit: null
+  vector_weight: 0.65
+  bm25_weight: 0.35

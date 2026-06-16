@@ -23,6 +23,12 @@ class ChatbotDemo:
                  top_k=20, 
                  top_p=0.9, 
                  temperature=1.0,
+                 num_candidates=32,
+                 context_window=5,
+                 phrase_window=32,
+                 min_threshold=0.5,
+                 sequence_cache_size=5,
+                 max_history_tokens=512,
                  use_coherence=True,
                  use_adaptive_temp=True,
                  use_sequence_memory=True,
@@ -38,6 +44,9 @@ class ChatbotDemo:
             self.model_mode = "both"
             
         print(f"Model mode: {self.model_mode}")
+        
+        # Store max_history_tokens
+        self.max_history_tokens = max_history_tokens
         
         # Initialize vanilla GPT-2 if needed
         if self.model_mode in ["vanilla", "both"]:
@@ -59,13 +68,14 @@ class ChatbotDemo:
             self.gen_config = GenerationConfig(
                 max_length=max_length,
                 batch_size=1,
-                num_candidates=32,
-                context_window=5,
-                phrase_window=32,
+                num_candidates=num_candidates,
+                context_window=context_window,
+                phrase_window=phrase_window,
                 base_temperature=temperature,
-                min_threshold=0.5,
+                min_threshold=min_threshold,
                 top_k=top_k,
                 top_p=top_p,
+                sequence_cache_size=sequence_cache_size,
                 use_adaptive_temperature=use_adaptive_temp,
                 use_coherence_scoring=use_coherence,
                 use_sequence_memory=use_sequence_memory,
@@ -87,7 +97,6 @@ class ChatbotDemo:
         # Separate conversation histories for each model
         self.vanilla_history = ""
         self.qgpt2_history = ""
-        self.max_history_tokens = 512  # Cap history to avoid exceeding context limits
         
         print(f"Models loaded successfully. Using device: {self.device}")
         
@@ -219,7 +228,67 @@ class ChatbotDemo:
         """Change the current model mode."""
         valid_modes = ["vanilla", "qgpt2", "both"]
         if mode.lower() in valid_modes:
+            old_mode = self.model_mode
             self.model_mode = mode.lower()
+            
+            # Initialize vanilla models if switching to vanilla/both and they don't exist
+            if self.model_mode in ["vanilla", "both"] and (self.vanilla_model is None or self.vanilla_tokenizer is None):
+                print("Initializing vanilla GPT-2 models...")
+                try:
+                    # Get model name from existing config or use default
+                    model_name = self.model_config.gpt2_model_name if self.model_config else "gpt2"
+                    
+                    self.vanilla_tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+                    if self.vanilla_tokenizer.pad_token is None:
+                        self.vanilla_tokenizer.pad_token = self.vanilla_tokenizer.eos_token
+                    
+                    self.vanilla_model = GPT2LMHeadModel.from_pretrained(model_name)
+                    self.vanilla_model = self.vanilla_model.to(self.device)
+                    self.vanilla_model.eval()
+                    print("Vanilla GPT-2 models initialized successfully.")
+                except Exception as e:
+                    print(f"Error initializing vanilla models: {e}")
+                    self.model_mode = old_mode  # Revert mode change
+                    return False
+            
+            # Initialize qGPT2 models if switching to qgpt2/both and they don't exist
+            if self.model_mode in ["qgpt2", "both"] and (self.qgpt2_model is None or self.gen_config is None):
+                print("Initializing qGPT2 models...")
+                try:
+                    # Create default configs if they don't exist
+                    if self.gen_config is None:
+                        self.gen_config = GenerationConfig(
+                            max_length=128,
+                            batch_size=1,
+                            num_candidates=32,
+                            context_window=512,
+                            phrase_window=32,
+                            base_temperature=0.2,
+                            min_threshold=0.5,
+                            top_k=256,
+                            top_p=0.9,
+                            sequence_cache_size=5,
+                            use_adaptive_temperature=True,
+                            use_coherence_scoring=True,
+                            use_sequence_memory=True,
+                            device=self.device
+                        )
+                    
+                    if self.model_config is None:
+                        model_name = "gpt2-medium"  # Default model
+                        self.model_config = ModelConfig(
+                            gpt2_model_name=model_name,
+                            tokenizer_name=model_name,
+                            sentence_transformer_name="all-MiniLM-L6-v2"
+                        )
+                    
+                    self.qgpt2_model = SemanticGPT2Generator(self.gen_config, self.model_config)
+                    print("qGPT2 models initialized successfully.")
+                except Exception as e:
+                    print(f"Error initializing qGPT2 models: {e}")
+                    self.model_mode = old_mode  # Revert mode change
+                    return False
+            
             print(f"Model mode set to: {self.model_mode}")
             return True
         else:
@@ -229,16 +298,48 @@ class ChatbotDemo:
     def print_current_config(self):
         """Print current configuration settings."""
         print("\n--- Current Configuration ---")
-        print(f"Model Mode: {self.model_mode}")
-        print(f"Max Length: {self.gen_config.max_length if self.gen_config else 'N/A'}")
-        print(f"Top-k: {self.gen_config.top_k if self.gen_config else 'N/A'}")
-        print(f"Top-p: {self.gen_config.top_p if self.gen_config else 'N/A'}")
-        print(f"Temperature: {self.gen_config.base_temperature if self.gen_config else 'N/A'}")
+        print(f"Model Mode (/mode): {self.model_mode}")
+        
+        # Always show model name first as it's a string value
+        print(f"model: \"{self.model_config.gpt2_model_name if hasattr(self, 'model_config') and self.model_config else 'gpt2'}\"")
         
         if self.gen_config:
-            print(f"Coherence Scoring: {self.gen_config.use_coherence_scoring}")
-            print(f"Adaptive Temperature: {self.gen_config.use_adaptive_temperature}")
-            print(f"Sequence Memory: {self.gen_config.use_sequence_memory}")
+            print(f"max_length: {self.gen_config.max_length}")
+            print(f"top_k: {self.gen_config.top_k}")
+            print(f"top_p: {self.gen_config.top_p}")
+            print(f"temperature: {self.gen_config.base_temperature}")
+            print(f"num_candidates: {self.gen_config.num_candidates}")
+            print(f"context_window: {self.gen_config.context_window}")
+            print(f"phrase_window: {self.gen_config.phrase_window}")
+            print(f"min_threshold: {self.gen_config.min_threshold}")
+            print(f"sequence_cache_size: {self.gen_config.sequence_cache_size}")
+            print(f"max_history_tokens: {self.max_history_tokens}")
+            print(f"use_coherence_scoring: {self.gen_config.use_coherence_scoring}")
+            print(f"use_adaptive_temperature: {self.gen_config.use_adaptive_temperature}")
+            print(f"use_sequence_memory: {self.gen_config.use_sequence_memory}")
+            
+            # Display sentence transformer model name if available
+            if hasattr(self.model_config, 'sentence_transformer_name'):
+                print(f"sentence_transformer_name: \"{self.model_config.sentence_transformer_name}\"")
+        else:
+            print(f"max_length: N/A")
+            print(f"top_k: N/A")
+            print(f"top_p: N/A")
+            print(f"temperature: N/A")
+            print(f"num_candidates: N/A")
+            print(f"context_window: N/A")
+            print(f"phrase_window: N/A")
+            print(f"min_threshold: N/A")
+            print(f"sequence_cache_size: N/A")
+            print(f"max_history_tokens: N/A")
+            print(f"use_coherence_scoring: N/A")
+            print(f"use_adaptive_temperature: N/A")
+            print(f"use_sequence_memory: N/A")
+        
+        print("\nTo change settings use: /set <parameter> <value>")
+        print("Example: /set model gpt2-medium")
+        print("Example: /set top_k 50")
+        print("Example: /set num_candidates 64")
         print("----------------------------\n")
     
     def run_chatbot(self):
@@ -289,14 +390,53 @@ class ChatbotDemo:
                     if len(parts) >= 3:
                         # Normalize parameter name by converting hyphens to underscores
                         param = parts[1].replace('-', '_')
+                        
+                        # Get the value part (handle quoted strings)
+                        value_part = ' '.join(parts[2:])
+                        value_part = value_part.strip('"\'')  # Remove quotes if present
+                        
                         try:
-                            # Parse value with appropriate type
-                            if parts[2].lower() in ['true', 'false']:
-                                value = parts[2].lower() == 'true'
-                            elif '.' in parts[2]:
-                                value = float(parts[2])
+                            # Special handling for model parameter
+                            if param == 'model':
+                                # Changing the model requires reinitialization
+                                model_name = value_part
+                                print(f"Reinitializing with model: {model_name}")
+
+                                # Save current mode
+                                old_mode = self.model_mode
+
+                                # Reinitialize the chatbot with the new model, preserving ALL current config
+                                self.__init__(
+                                    model_name=model_name,
+                                    max_length=self.gen_config.max_length if self.gen_config else 50,
+                                    top_k=self.gen_config.top_k if self.gen_config else 50,
+                                    top_p=self.gen_config.top_p if self.gen_config else 0.9,
+                                    temperature=self.gen_config.base_temperature if self.gen_config else 1.0,
+                                    num_candidates=self.gen_config.num_candidates if self.gen_config else 32,
+                                    context_window=self.gen_config.context_window if self.gen_config else 5,
+                                    phrase_window=self.gen_config.phrase_window if self.gen_config else 32,
+                                    min_threshold=self.gen_config.min_threshold if self.gen_config else 0.5,
+                                    sequence_cache_size=self.gen_config.sequence_cache_size if self.gen_config else 5,
+                                    max_history_tokens=self.max_history_tokens,
+                                    use_coherence=self.gen_config.use_coherence_scoring if self.gen_config else True,
+                                    use_adaptive_temp=self.gen_config.use_adaptive_temperature if self.gen_config else True,
+                                    use_sequence_memory=self.gen_config.use_sequence_memory if self.gen_config else True,
+                                    model_mode=old_mode
+                                )
+                                print(f"Model changed to: {model_name}")
+                                continue
+                            
+                            # Parse value with appropriate type for other parameters
+                            if value_part.lower() in ['true', 'false']:
+                                value = value_part.lower() == 'true'
+                            elif '.' in value_part:
+                                value = float(value_part)
                             else:
-                                value = int(parts[2])
+                                try:
+                                    value = int(value_part)
+                                except ValueError:
+                                    # If not a number, keep as string
+                                    value = value_part
                                 
                             self.update_config(**{param: value})
                         except (ValueError, AttributeError) as e:
@@ -334,14 +474,20 @@ class ChatbotDemo:
 def main():
     parser = argparse.ArgumentParser(description="qGPT2 vs GPT-2 Chatbot Demo")
     parser.add_argument("--model", type=str, default="gpt2", help="Model name (gpt2, gpt2-medium, etc.)")
-    parser.add_argument("--max-length", type=int, default=50, help="Maximum response length")
-    parser.add_argument("--top-k", type=int, default=20, help="Top-k sampling parameter")
+    parser.add_argument("--max-length", type=int, default=512, help="Maximum response length")
+    parser.add_argument("--top-k", type=int, default=256, help="Top-k sampling parameter")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p (nucleus) sampling parameter")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
+    parser.add_argument("--temperature", type=float, default=1, help="Sampling temperature")
+    parser.add_argument("--num-candidates", type=int, default=512, help="Number of candidate tokens to consider")
+    parser.add_argument("--context-window", type=int, default=512, help="Context window size")
+    parser.add_argument("--phrase-window", type=int, default=128, help="Phrase window for coherence scoring")
+    parser.add_argument("--min-threshold", type=float, default=0.8, help="Minimum threshold for coherence scores")
+    parser.add_argument("--sequence-cache-size", type=int, default=32, help="Size of sequence memory cache")
+    parser.add_argument("--max-history-tokens", type=int, default=1024, help="Maximum history tokens to maintain")
     parser.add_argument("--no-coherence", action="store_true", help="Disable coherence scoring")
     parser.add_argument("--no-adaptive-temp", action="store_true", help="Disable adaptive temperature")
     parser.add_argument("--no-sequence-memory", action="store_true", help="Disable sequence memory")
-    parser.add_argument("--mode", type=str, choices=["vanilla", "qgpt2", "both"], default="both",
+    parser.add_argument("--mode", type=str, choices=["vanilla", "qgpt2", "both"], default="qgpt2",
                        help="Model mode: vanilla (GPT-2 only), qgpt2 (qGPT2 only), or both")
     
     args = parser.parse_args()
@@ -352,6 +498,12 @@ def main():
         top_k=args.top_k,
         top_p=args.top_p,
         temperature=args.temperature,
+        num_candidates=args.num_candidates,
+        context_window=args.context_window,
+        phrase_window=args.phrase_window,
+        min_threshold=args.min_threshold,
+        sequence_cache_size=args.sequence_cache_size,
+        max_history_tokens=args.max_history_tokens,
         use_coherence=not args.no_coherence,
         use_adaptive_temp=not args.no_adaptive_temp,
         use_sequence_memory=not args.no_sequence_memory,

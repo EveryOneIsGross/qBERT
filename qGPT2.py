@@ -144,7 +144,8 @@ class SequenceMemoryCache:
                     dim=1
                 ).item()
                 
-                if similarity > self.similarity_threshold:
+                if similarity > self.similarity_threshold and similarity < 0.95:
+
                     results.append({"text": seq["text"], "similarity": similarity})
             return results
             
@@ -196,50 +197,31 @@ class SemanticGPT2Generator(nn.Module):
         with torch.no_grad():
             embeddings = self.sentence_transformer.encode(text, convert_to_tensor=True)
             return embeddings.to(self.config.device)
-    
+        
     def get_gpt2_predictions(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get GPT-2 predictions for the next token."""
         with torch.no_grad():
+            max_pos = self.gpt2_model.config.n_positions
+            if input_ids.size(1) > max_pos:
+                input_ids = input_ids[:, -max_pos:]
             outputs = self.gpt2_model(input_ids)
-            logits = outputs.logits[:, -1, :]  # Get logits for the last position only
-            
-            # Apply top-k filtering
-            top_k_logits, top_k_indices = torch.topk(
-                logits, 
-                min(self.config.top_k, logits.size(-1))
-            )
-            
-            # Optional: Apply top-p filtering (nucleus sampling)
+            logits = outputs.logits[:, -1, :]
+            top_k_logits, top_k_indices = torch.topk(logits, min(self.config.top_k, logits.size(-1)))
             if hasattr(self.config, 'top_p') and self.config.top_p < 1.0:
                 probs = F.softmax(top_k_logits, dim=-1)
                 sorted_probs, sorted_indices = torch.sort(probs, descending=True)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                
-                # Remove tokens with cumulative probability above the threshold
                 sorted_indices_to_remove = cumulative_probs > self.config.top_p
-                # Keep tokens that are above threshold but make sure at least one token remains
                 if sorted_indices_to_remove.any():
                     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                     sorted_indices_to_remove[..., 0] = 0
-                    
-                # Scatter back the indices
-                indices_to_remove = sorted_indices_to_remove.scatter(
-                    dim=-1, 
-                    index=sorted_indices, 
-                    src=sorted_indices_to_remove
-                )
-                
-                # Only keep tokens that pass the filter
+                indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
                 filtered_logits = top_k_logits.masked_fill(indices_to_remove, -float('inf'))
                 filtered_indices = top_k_indices.clone()
-                
-                # Get new top-k after filtering
                 valid_count = (~indices_to_remove).sum().item()
                 if valid_count > 0:
                     filtered_top_k = min(valid_count, self.config.top_k)
                     top_k_logits, idx = torch.topk(filtered_logits, k=filtered_top_k)
                     top_k_indices = filtered_indices.gather(-1, idx)
-            
             return top_k_logits, top_k_indices
     
     def calculate_coherence_scores(self, 
@@ -294,7 +276,7 @@ class SemanticGPT2Generator(nn.Module):
                     for i, candidate in enumerate(candidates):
                         for sequence in similar_sequences:
                             if candidate in sequence:
-                                sequence_boost[i] *= 1.2  # Boost by 20%
+                                sequence_boost[i] = min(sequence_boost[i] * 1.2, 1.05)  # Cap the boost
                                 break
                     
                     # Apply boosting to length penalties
@@ -318,64 +300,72 @@ class SemanticGPT2Generator(nn.Module):
                 print(f"Warning: Coherence scoring failed with error: {e}")
                 return torch.ones(len(candidates), device=self.config.device)
     
-    def coherence_based_sampling(self, 
+    def coherence_based_sampling(self,
                                candidates: torch.Tensor,
                                coherence_scores: torch.Tensor,
-                               gpt2_scores: torch.Tensor) -> torch.Tensor:
-        """Sample tokens based on combined GPT-2 and coherence scores."""
+                               gpt2_logits: torch.Tensor) -> torch.Tensor:
+        """Sample tokens based on combined GPT-2 logits and coherence weights.
+
+        Uses log-space fusion: log P(token) = log P_GPT2(token) + log(coherence_weight)
+        This treats coherence as a Bayesian prior in energy space.
+        """
         # Handle empty candidates case
         if len(candidates) == 0:
             return torch.tensor(0, device=self.config.device)
-            
+
         # Ensure all tensors have the same length
-        min_len = min(len(candidates), len(coherence_scores), len(gpt2_scores))
+        min_len = min(len(candidates), len(coherence_scores), len(gpt2_logits))
         candidates = candidates[:min_len]
         coherence_scores = coherence_scores[:min_len]
-        gpt2_scores = gpt2_scores[:min_len]
-        
-        # Normalize scores to prevent numerical issues
-        gpt2_scores = F.softmax(gpt2_scores, dim=-1)
-        coherence_scores = torch.clamp(coherence_scores, min=0.1, max=1.0)
-        
-        combined_scores = gpt2_scores * coherence_scores
-        
+        gpt2_logits = gpt2_logits[:min_len]
+
+        # Clamp coherence to valid range and take log for log-space fusion
+        coherence_weights = torch.clamp(coherence_scores, min=0.1, max=1.0)
+        log_coherence = torch.log(coherence_weights + 1e-8)  # Add epsilon for numerical stability
+
+        # Scale coherence influence (alpha controls strength)
+        # alpha = 2.0 means coherence weights are squared in probability space
+        # This amplifies the difference between high and low coherence scores
+        coherence_alpha = 2.0
+        scaled_log_coherence = coherence_alpha * log_coherence
+
+        # Combine in log-space: logits + alpha * log(coherence)
+        # coherence acts as a multiplicative prior in probability space
+        combined_logits = gpt2_logits + scaled_log_coherence
+
         # Apply adaptive temperature if enabled, otherwise use base temperature
         if self.config.use_adaptive_temperature:
-            mean_coherence = torch.mean(coherence_scores)
+            mean_coherence = torch.mean(coherence_weights)
             temperature = self.config.base_temperature * (1 / mean_coherence)
             temperature = torch.clamp(temperature, min=0.1, max=2.0)
         else:
             temperature = self.config.base_temperature
-        
-        # Apply threshold filtering
-        threshold = torch.mean(combined_scores) * self.config.min_threshold
-        valid_candidates = combined_scores > threshold
-        
+
+        # Apply temperature scaling to combined logits
+        scaled_logits = combined_logits / temperature
+
+        # Convert to probabilities
+        probs = F.softmax(scaled_logits, dim=-1)
+
+        # Apply threshold filtering based on probabilities
+        threshold = torch.mean(probs) * self.config.min_threshold
+        valid_candidates = probs > threshold
+
         # If no candidates pass the threshold, use all candidates
         if not torch.any(valid_candidates):
-            valid_candidates = torch.ones_like(combined_scores, dtype=torch.bool)
-        
-        # Apply temperature and sample
-        scaled_scores = combined_scores[valid_candidates] / temperature
-        
-        # Handle numerical stability
-        max_score = torch.max(scaled_scores)
-        exp_scores = torch.exp(scaled_scores - max_score)
-        probs = exp_scores / torch.sum(exp_scores)
-        
-        # Ensure probs sum to 1
-        probs = probs / torch.sum(probs)
-        
-        # Sample from the distribution
+            valid_candidates = torch.ones_like(probs, dtype=torch.bool)
+
+        # Sample from filtered distribution
+        filtered_probs = probs[valid_candidates]
+        filtered_probs = filtered_probs / filtered_probs.sum()  # Renormalize
+
         try:
-            sample_idx = torch.multinomial(probs, num_samples=1)
-            valid_indices = torch.where(valid_candidates)[0]
-            selected_idx = valid_indices[sample_idx]
+            sample_idx = torch.multinomial(filtered_probs, num_samples=1).item()
+            selected_idx = torch.where(valid_candidates)[0][sample_idx]
         except RuntimeError:
-            # Fallback to argmax if sampling fails
-            selected_idx = torch.argmax(combined_scores).unsqueeze(0)
-        
-        return selected_idx.squeeze()
+            selected_idx = torch.argmax(probs)
+
+        return selected_idx
     
     def generate_stream(self, initial_text: str, num_tokens: int) -> Iterator[str]:
         """Stream tokens one by one with semantic coherence guidance."""
@@ -491,14 +481,29 @@ def generate_text(model: SemanticGPT2Generator,
             
             # Calculate coherence scores
             coherence_scores = model.calculate_coherence_scores(candidate_tokens, generated_text) if model.config.use_coherence_scoring else torch.ones(len(candidate_tokens), device=model.config.device)
-            
-            # Get GPT-2 probabilities
+
+            # Get GPT-2 probabilities (for display)
             gpt2_probs = F.softmax(top_k_logits[0], dim=-1)
-            
-            # Calculate combined scores
-            combined_scores = gpt2_probs * torch.clamp(coherence_scores, min=0.1, max=1.0)
-            combined_probs = combined_scores / combined_scores.sum()
-            
+
+            # Calculate combined probabilities using LOG-SPACE fusion (matching coherence_based_sampling)
+            coherence_weights = torch.clamp(coherence_scores, min=0.1, max=1.0)
+            log_coherence = torch.log(coherence_weights + 1e-8)
+
+            # Apply alpha scaling (must match coherence_based_sampling)
+            coherence_alpha = 2.0
+            scaled_log_coherence = coherence_alpha * log_coherence
+            combined_logits = top_k_logits[0] + scaled_log_coherence
+
+            # Apply temperature (matching coherence_based_sampling)
+            if model.config.use_adaptive_temperature:
+                mean_coherence = torch.mean(coherence_weights)
+                temperature = model.config.base_temperature * (1 / mean_coherence)
+                temperature = torch.clamp(temperature, min=0.1, max=2.0)
+            else:
+                temperature = model.config.base_temperature
+
+            combined_probs = F.softmax(combined_logits / temperature, dim=-1)
+
             # Sample next token
             selected_idx = model.coherence_based_sampling(
                 top_k_indices[0],
@@ -532,7 +537,7 @@ def generate_text(model: SemanticGPT2Generator,
             token_data.sort(key=lambda x: x[3], reverse=True)
             
             # Print in a compact format
-            print(f"{'Token':<8} | {'GPT2%':<7} | {'Coh.':<7} | {'Combined%':<7}")
+            print(f"{'Token':<8} | {'GPT2%':<7} | {'Weight':<7} | {'Final%':<7}")
             print("-" * 36)
             for token, gpt2_p, coh, comb in token_data[:5]:  # Show top 5
                 # Highlight the selected token
@@ -570,14 +575,14 @@ def generate_text(model: SemanticGPT2Generator,
 if __name__ == "__main__":
     # Configuration for the model
     gen_config = GenerationConfig(
-        max_length=100,
+        max_length=1000,
         batch_size=1,
         num_candidates=32,
-        context_window=5,
+        context_window=256,
         phrase_window=32,
         base_temperature=1.0,
         min_threshold=0.5,
-        top_k=20,  # Reduced for cleaner probability display
+        top_k=264,  # Reduced for cleaner probability display
         top_p=0.9,
         use_adaptive_temperature=True,
         use_coherence_scoring=True,

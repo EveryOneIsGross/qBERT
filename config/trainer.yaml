@@ -1,0 +1,83 @@
+# trainer.yaml — default config for qBERT fine-tuning
+# All values here can be overridden by passing the equivalent CLI flag.
+# CLI flags always win over this file.
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset_name: "json"
+data_files: "hf://datasets/NousResearch/Hermes-3-Dataset/hermes-3-dataset.jsonl"
+train_split: "train"
+# eval_split: null
+# dataset_config_name: null
+max_train_samples: 20000
+max_eval_samples: 20000
+trust_remote_code: false
+
+# ── Format ────────────────────────────────────────────────────────────────────
+format: "sharegpt"
+conversation_column: "conversations"
+role_field: "from"
+content_field: "value"
+system_role: "system"
+user_role: "human"
+assistant_role: "gpt"
+# question_column: "question"   # qa format only
+# answer_column: "answer"       # qa format only
+# text_column: "text"           # text format only
+# default_system_prompt: ""
+
+# ── Special tokens ────────────────────────────────────────────────────────────
+system_token: "[SYSTEM]"
+user_token: "[USER]"
+assistant_token: "[ASSISTANT]"
+eot_token: "[EOT]"
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_name_or_path: "bert-base-cased"
+output_dir: "./qbert-hermes-v4"
+
+# ── Sequence ──────────────────────────────────────────────────────────────────
+max_seq_length: 512
+
+# ── Training ──────────────────────────────────────────────────────────────────
+num_train_epochs: 5
+per_device_train_batch_size: 8
+per_device_eval_batch_size: 8
+learning_rate: 0.00005
+weight_decay: 0.01
+warmup_ratio: 0.03
+seed: 42
+
+# ── MLM / collator ────────────────────────────────────────────────────────────
+mlm_probability: 0.15         # masking rate for assistant content
+context_mlm_probability: 0.10  # masking rate for user/system content
+assistant_only: false           # true = disable context MLM entirely
+# Boundary steering: boosts masking probability within boundary_window positions
+# of [ASSISTANT] and [EOT] tokens, concentrating gradient at turn boundaries.
+boundary_mlm_bonus: 0.25
+boundary_window: 5
+# eot_as_target: train the model to predict [EOT] at the end of assistant turns
+# (the "I am done" signal). Set to false to keep [EOT] invisible to loss.
+eot_as_target: true
+
+# ── Logging / checkpointing ───────────────────────────────────────────────────
+logging_steps: 100
+save_steps: 1000
+eval_steps: 500
+eval_strategy: "steps"
+save_total_limit: 2
+
+# ── Sentence Transformer fine-tuning (trainer_st.py) ─────────────────────────
+# Reads all dataset/format/special-token settings above automatically.
+sentence_model_name_or_path: "all-MiniLM-L6-v2"
+st_output_dir: "./qbert-st-hermes-v4"
+include_system_in_anchor: true   # prepend [SYSTEM] content to the user anchor
+add_role_prefixes: true          # prefix text with [USER] / [ASSISTANT] tokens
+st_max_pairs: 50000              # 0 = extract all pairs from max_train_samples
+st_eval_fraction: 0.05
+st_num_train_epochs: 1
+st_batch_size: 64                # bigger = more in-batch negatives = better MNRL
+st_learning_rate: 0.00002
+st_warmup_ratio: 0.1
+st_eval_steps: 500
+st_save_steps: 1000
+st_save_total_limit: 2
